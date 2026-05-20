@@ -17,11 +17,13 @@ except ImportError:  # pragma: no cover - 초기 설치 전 보호
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - 초기 설치 전 보호
-    def load_dotenv() -> None:
+    def load_dotenv(*args, **kwargs) -> None:
         return None
 
 
-load_dotenv()
+# CWD와 무관하게 이 파일 기준으로 프로젝트 루트 .env를 찾는다
+_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_ENV_PATH, override=True)
 
 REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
 PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
@@ -30,7 +32,16 @@ PRICE_ENDPOINT = "/uapi/domestic-stock/v1/quotations/inquire-price"
 PRICE_TR_ID = "FHKST01010100"
 DAILY_CHART_ENDPOINT = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
 DAILY_CHART_TR_ID = "FHKST03010100"
+ORDER_ENDPOINT = "/uapi/domestic-stock/v1/trading/order-cash"
+BALANCE_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-balance"
+ORDER_HISTORY_ENDPOINT = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
 KIS_MARKET_CODE = "J"
+
+# 모의투자 TR ID (실전: TTTC0802U/TTTC0801U — 이번 구현에서는 demo 전용)
+_TR_ORDER_BUY = "VTTC0802U"
+_TR_ORDER_SELL = "VTTC0801U"
+_TR_BALANCE = "VTTC8434R"
+_TR_ORDER_HISTORY = "VTTC8001R"
 
 _TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 _LAST_REQUEST_TS = 0.0
@@ -46,6 +57,8 @@ def _base_price(symbol: str) -> int:
 
 
 def _missing_env() -> list[str]:
+    # Streamlit은 모듈을 캐시하므로, 매 호출마다 .env를 재로드해 최신 값을 반영한다.
+    load_dotenv(_ENV_PATH, override=True)
     required = [
         "KIS_APP_KEY",
         "KIS_APP_SECRET",
@@ -242,6 +255,11 @@ def _get_access_token() -> str:
     return access_token
 
 
+def _account_params() -> tuple[str, str]:
+    """(계좌번호, 상품코드) 반환."""
+    return os.getenv("KIS_ACCOUNT_NO", "").strip(), os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "").strip()
+
+
 def _request_kis_json(
     *,
     endpoint: str,
@@ -288,6 +306,43 @@ def _request_kis_json(
         raise RuntimeError(f"KIS API 요청 실패: {message}")
 
     raise RuntimeError("KIS API 요청이 반복적으로 제한되었습니다. 잠시 후 다시 시도하세요.")
+
+
+def _post_kis_json(
+    *,
+    endpoint: str,
+    tr_id: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """KIS API POST 요청 (주문 전용)."""
+    if requests is None:
+        raise RuntimeError("requests 패키지가 없어 KIS API를 호출할 수 없습니다.")
+
+    env_name = _env_name()
+    app_key = os.getenv("KIS_APP_KEY", "").strip()
+    app_secret = os.getenv("KIS_APP_SECRET", "").strip()
+    access_token = _get_access_token()
+
+    _throttle_requests()
+    response = requests.post(
+        f"{_base_url(env_name)}{endpoint}",
+        headers={
+            "Content-Type": "application/json",
+            "authorization": f"Bearer {access_token}",
+            "appkey": app_key,
+            "appsecret": app_secret,
+            "tr_id": tr_id,
+            "custtype": "P",
+            "hashkey": "",
+        },
+        json=body,
+        timeout=15,
+    )
+    data = _safe_json(response)
+    if response.ok and data.get("rt_cd") in (None, "", "0"):
+        return data
+    message = data.get("msg1") or data.get("message") or response.text
+    raise RuntimeError(f"KIS 주문 요청 실패: {message}")
 
 
 def _format_as_of(output: dict[str, Any]) -> str:
@@ -400,28 +455,155 @@ def get_price_history(symbol: str, start_date: date, end_date: date) -> list[dic
 
 
 def get_balance_snapshot() -> dict[str, Any]:
+    """잔고 조회 (VTTC8434R). 샘플 모드에서는 더미 데이터 반환."""
+    if using_sample_data():
+        return {
+            "summary": {"cash": 10_000_000, "evaluation_amount": 0, "profit_loss": 0},
+            "holdings": [],
+            "source": "sample-placeholder",
+        }
+
+    account_no, product_code = _account_params()
+    data = _request_kis_json(
+        endpoint=BALANCE_ENDPOINT,
+        tr_id=_TR_BALANCE,
+        params={
+            "CANO": account_no,
+            "ACNT_PRDT_CD": product_code,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        },
+    )
+    summary_list = data.get("output2") or [{}]
+    raw = summary_list[0] if summary_list else {}
+    holdings = []
+    for h in data.get("output1") or []:
+        qty = _to_int(h.get("hldg_qty"))
+        if qty <= 0:
+            continue
+        holdings.append({
+            "symbol": h.get("pdno", ""),
+            "company_name": h.get("prdt_name", ""),
+            "qty": qty,
+            "avg_price": _to_float(h.get("pchs_avg_pric")),
+            "current_price": _to_int(h.get("prpr")),
+            "evaluation_amount": _to_int(h.get("evlu_amt")),
+            "profit_loss": _to_int(h.get("evlu_pfls_amt")),
+            "profit_loss_pct": _to_float(h.get("evlu_erng_rt")),
+        })
     return {
         "summary": {
-            "cash": 10000000,
-            "evaluation_amount": 0,
-            "profit_loss": 0,
+            "cash": _to_int(raw.get("dnca_tot_amt")),
+            "evaluation_amount": _to_int(raw.get("scts_evlu_amt")),
+            "total_amount": _to_int(raw.get("tot_evlu_amt")),
+            "profit_loss": _to_int(raw.get("evlu_pfls_smtl_amt")),
         },
-        "holdings": [],
-        "source": "sample-placeholder",
+        "holdings": holdings,
+        "source": "kis-openapi",
     }
 
 
-def get_order_history() -> list[dict[str, Any]]:
-    return []
+def get_order_history(*, ccld_dvsn: str = "00") -> list[dict[str, Any]]:
+    """당일 주문내역 조회 (VTTC8001R).
+
+    ccld_dvsn: "00"=전체, "01"=체결, "02"=미체결
+    """
+    if using_sample_data():
+        return []
+
+    account_no, product_code = _account_params()
+    today = datetime.now().strftime("%Y%m%d")
+    data = _request_kis_json(
+        endpoint=ORDER_HISTORY_ENDPOINT,
+        tr_id=_TR_ORDER_HISTORY,
+        params={
+            "CANO": account_no,
+            "ACNT_PRDT_CD": product_code,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "01",
+            "PDNO": "",
+            "CCLD_DVSN": ccld_dvsn,
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        },
+    )
+    result = []
+    for o in data.get("output1") or []:
+        side_code = o.get("sll_buy_dvsn_cd", "")
+        result.append({
+            "order_no": o.get("odno", ""),
+            "symbol": o.get("pdno", ""),
+            "company_name": o.get("prdt_name", ""),
+            "side": "매수" if side_code == "02" else "매도",
+            "order_type": "시장가" if o.get("ord_dvsn_cd") == "01" else "지정가",
+            "qty": _to_int(o.get("ord_qty")),
+            "price": _to_int(o.get("ord_unpr")),
+            "filled_qty": _to_int(o.get("tot_ccld_qty")),
+            "avg_fill_price": _to_int(o.get("avg_prvs")),
+            "status": o.get("ord_stts", ""),
+            "time": o.get("ord_tmd", ""),
+        })
+    return result
 
 
 def get_open_orders() -> list[dict[str, Any]]:
-    return []
+    """미체결 주문 조회 (VTTC8001R CCLD_DVSN=02)."""
+    return get_order_history(ccld_dvsn="02")
 
 
 def submit_paper_order(order_payload: dict[str, Any]) -> dict[str, Any]:
+    """모의투자 주문 제출. real 환경에서는 호출 자체를 차단한다."""
+    if _env_name() == "real":
+        raise RuntimeError("실전 주문은 이 앱에서 지원하지 않습니다. KIS_ENV=demo로 설정하세요.")
+
+    if using_sample_data():
+        return {
+            "ok": False,
+            "message": "샘플 데이터 모드에서는 주문을 보낼 수 없습니다. .env의 KIS API 키를 확인하세요.",
+            "order_no": "",
+        }
+
+    account_no, product_code = _account_params()
+    side = order_payload.get("side", "buy")
+    order_type = order_payload.get("order_type", "market")
+    symbol = str(order_payload.get("symbol", "")).strip()
+    qty = int(order_payload.get("qty", 1))
+    price = int(order_payload.get("price", 0))
+
+    tr_id = _TR_ORDER_BUY if side == "buy" else _TR_ORDER_SELL
+    # KIS 주문구분코드: 00=지정가, 01=시장가
+    ord_dvsn = "01" if order_type == "market" else "00"
+    ord_unpr = "0" if order_type == "market" else str(price)
+
+    data = _post_kis_json(
+        endpoint=ORDER_ENDPOINT,
+        tr_id=tr_id,
+        body={
+            "CANO": account_no,
+            "ACNT_PRDT_CD": product_code,
+            "PDNO": symbol,
+            "ORD_DVSN": ord_dvsn,
+            "ORD_QTY": str(qty),
+            "ORD_UNPR": ord_unpr,
+        },
+    )
+    output = data.get("output") or {}
     return {
-        "ok": False,
-        "message": "스켈레톤 단계에서는 실제 주문을 보내지 않습니다. 10-8장에서 주문 요청과 결과 확인 연결.",
-        "request": order_payload,
+        "ok": True,
+        "message": (data.get("msg1") or "주문이 접수되었습니다.").strip(),
+        "order_no": output.get("odno", ""),
+        "order_time": output.get("ord_tmd", ""),
     }
